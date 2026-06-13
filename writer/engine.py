@@ -22,7 +22,7 @@ import warnings
 from pydantic import BaseModel, ValidationError
 
 from .config import Provider
-from .models import Characters, Concept, Outline, World
+from .models import ChapterReview, Characters, Concept, Outline, World
 from .project import Project
 
 PLAN_MAX_TOKENS = 8000
@@ -110,7 +110,13 @@ class Writer:
             )
         return base
 
-    def _plan(self, instruction: str, schema: type[BaseModel], retries: int = 3):
+    def _plan(
+        self,
+        instruction: str,
+        schema: type[BaseModel],
+        retries: int = 3,
+        system: str | None = None,
+    ):
         """JSON-structured planning call validated against a pydantic schema."""
         schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
         user = (
@@ -119,32 +125,30 @@ class Writer:
             f"that conforms to this JSON schema:\n{schema_json}"
         )
         messages = [
-            {"role": "system", "content": self._system()},
+            {"role": "system", "content": system or self._system()},
             {"role": "user", "content": user},
         ]
         last_err = ""
         for _ in range(retries):
-            kwargs = dict(
-                model=self.planner.model,
-                max_tokens=PLAN_MAX_TOKENS,
-                messages=messages,
-            )
-            if self._json_mode_ok:
-                try:
-                    resp = self._planner_client.chat.completions.create(
-                        response_format={"type": "json_object"}, **kwargs
-                    )
-                except Exception as e:
-                    self._json_mode_ok = False
-                    warnings.warn(
-                        f"Provider {self.planner.name!r} rejected JSON mode "
-                        f"(response_format); falling back to plain parsing. {e}",
-                        stacklevel=2,
-                    )
-                    resp = self._planner_client.chat.completions.create(**kwargs)
-            else:
-                resp = self._planner_client.chat.completions.create(**kwargs)
-            content = resp.choices[0].message.content or ""
+            fmt = {"type": "json_object"} if self._json_mode_ok else None
+            try:
+                content = self._stream_messages(
+                    self._planner_client, self.planner.model, messages,
+                    PLAN_MAX_TOKENS, response_format=fmt,
+                )
+            except Exception as e:
+                if fmt is None:
+                    raise
+                # Provider may reject response_format — warn once, retry plain.
+                self._json_mode_ok = False
+                warnings.warn(
+                    f"Provider {self.planner.name!r} rejected JSON mode "
+                    f"(response_format); falling back to plain parsing. {e}",
+                    stacklevel=2,
+                )
+                content = self._stream_messages(
+                    self._planner_client, self.planner.model, messages, PLAN_MAX_TOKENS
+                )
             try:
                 return schema.model_validate_json(_extract_json(content))
             except (ValidationError, json.JSONDecodeError, ValueError) as e:
@@ -161,19 +165,15 @@ class Writer:
                 )
         raise RuntimeError(f"Planning failed after {retries} tries: {last_err}")
 
-    def _stream(self, client, model: str, system: str, user: str, max_tokens: int) -> str:
-        """Streaming call; echoes to stdout and returns the full text."""
+    def _stream_messages(
+        self, client, model: str, messages: list, max_tokens: int, response_format=None
+    ) -> str:
+        """Streaming chat call; echoes to stdout and returns the full text."""
+        kwargs = dict(model=model, max_tokens=max_tokens, stream=True, messages=messages)
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         parts: list[str] = []
-        stream = client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            stream=True,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        for chunk in stream:
+        for chunk in client.chat.completions.create(**kwargs):
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta.content or ""
@@ -183,6 +183,13 @@ class Writer:
                 sys.stdout.flush()
         sys.stdout.write("\n")
         return "".join(parts).strip()
+
+    def _stream(self, client, model: str, system: str, user: str, max_tokens: int) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        return self._stream_messages(client, model, messages, max_tokens)
 
     def _write_stream(self, system: str, user: str) -> str:
         return self._stream(
@@ -288,6 +295,11 @@ class Writer:
             summaries[ch.number] = self._summarize(ch.number, ch.title, body)
             self.project.save_continuity(summaries)
 
+        if chapter is None:
+            removed = self.project.prune_to({c.number for c in chapters})
+            if removed:
+                self._log(f"Pruned {len(removed)} stale chapter(s): {removed}")
+
         self._assemble()
 
     def _draft_prompt(self, ch, continuity: str) -> str:
@@ -314,9 +326,14 @@ class Writer:
 
     # ----- revise ----------------------------------------------------------------
 
-    def revise(self, chapter: int | None = None) -> None:
+    # ----- polish (per-chapter language + consistency) ---------------------------
+
+    def polish(self, chapter: int | None = None, instructions: str | None = None) -> None:
         self._load_bible()
         summaries = self.project.load_continuity()
+        instructions = (instructions or "").strip() or None
+        if instructions:
+            self._log(f"Polish focus: {instructions}")
 
         if chapter is None:
             targets = [c for c in self.outline.chapters if self.project.has_chapter(c.number)]
@@ -328,6 +345,12 @@ class Writer:
                 raise StageError(f"Chapter {chapter} not drafted yet.")
             targets = [ch]
 
+        focus_block = (
+            "PRIORITIZE THIS REVISION INSTRUCTION above the general goals below:\n"
+            f"{instructions}\n\n"
+            if instructions
+            else ""
+        )
         for ch in targets:
             self._log(f"\n--- Revising Chapter {ch.number}: {ch.title} ---")
             draft = self.project.read_chapter(ch.number)
@@ -336,12 +359,12 @@ class Writer:
                 f"STORY SO FAR (for consistency):\n{continuity}\n\n" if continuity else ""
             )
             user = (
-                f"{cont_block}"
-                f'Revise and polish Chapter {ch.number} ("{ch.title}") below. '
+                f"{cont_block}{focus_block}"
+                f'Polish Chapter {ch.number} ("{ch.title}") below. '
                 "Improve prose quality, pacing, and word choice; fix continuity or "
                 "characterization slips against the story bible and the story so "
                 "far; tighten weak passages. Keep the plot and structure intact and "
-                "preserve the approximate length. Output ONLY the revised chapter "
+                "preserve the approximate length. Output ONLY the polished chapter "
                 f"prose, in {self.language}, with no heading or notes.\n\n"
                 f"--- CURRENT DRAFT ---\n{draft}"
             )
@@ -352,40 +375,185 @@ class Writer:
 
         self._assemble()
 
+    # ----- revise (re-plan the story bible from the critique) --------------------
+
+    def revise(self) -> None:
+        """Revise the story bible (concept/characters/world/outline) using the
+        critic's review. Chapters are NOT touched — re-run 'draft' afterwards to
+        rewrite them against the revised bible."""
+        if not self.project.has_critique():
+            raise StageError("No critique found. Run 'critic' first.")
+        self._load_bible()
+        crit = (
+            "=== CRITIC REVIEW ===\n"
+            f"{self.project.read_critique()}\n\n"
+            "=== PER-CHAPTER ISSUES ===\n"
+            f"{self.project.read_critique_issues()}"
+        )
+        guide = (
+            "A critic reviewed the drafted novel. Revise the story plan to fix the "
+            "problems they raised while preserving what already works. You may "
+            "restructure, merge, split, add, or cut chapters as needed.\n\n"
+            f"{crit}"
+        )
+
+        self._log("\n=== Revising concept ===")
+        self.concept = self._plan(
+            f"{guide}\n\nHere is the CURRENT concept:\n{self._fmt_concept()}\n\n"
+            "Produce a revised concept that addresses the critique. Keep the core "
+            "identity unless the critique calls for a deeper change.",
+            Concept,
+        )
+        self.project.save_concept(self.concept)
+
+        self._log("\n=== Revising characters ===")
+        self.characters = self._plan(
+            f"{guide}\n\nRevised concept:\n{self._fmt_concept()}\n\n"
+            f"Current characters:\n{self._fmt_characters()}\n\n"
+            "Produce a revised cast addressing the critique (fix flat or "
+            "inconsistent characters, sharpen distinct voices).",
+            Characters,
+        )
+        self.project.save_characters(self.characters)
+
+        self._log("\n=== Revising world ===")
+        self.world = self._plan(
+            f"{guide}\n\nRevised concept:\n{self._fmt_concept()}\n\n"
+            f"Revised characters:\n{self._fmt_characters()}\n\n"
+            f"Current world:\n{self._fmt_world()}\n\n"
+            "Produce a revised world that resolves any setting/logic problems the "
+            "critique raised.",
+            World,
+        )
+        self.project.save_world(self.world)
+
+        self._log("\n=== Revising outline ===")
+        self.outline = self._plan(
+            f"{guide}\n\nRevised concept:\n{self._fmt_concept()}\n\n"
+            f"Revised characters:\n{self._fmt_characters()}\n\n"
+            f"Revised world:\n{self._fmt_world()}\n\n"
+            f"Current outline:\n{self._fmt_outline()}\n\n"
+            "Produce a revised chapter-by-chapter outline that fixes the plot, "
+            "pacing, and logic problems from the critique. You decide the chapter "
+            "count and each chapter's word_budget; budgets should sum to roughly "
+            f"{self.length:,}. Number chapters from 1.",
+            Outline,
+        )
+        for i, ch in enumerate(self.outline.chapters, start=1):
+            ch.number = i
+            ch.word_budget = max(300, ch.word_budget)
+        self.project.save_outline(self.outline)
+        self._bible_cache = None
+
+        removed = self.project.prune_to({ch.number for ch in self.outline.chapters})
+        if removed:
+            self._log(f"Pruned {len(removed)} stale chapter(s): {removed}")
+
+        self._log(
+            f"\nBible revised ({len(self.outline.chapters)} chapters). "
+            "Re-run 'draft' to rewrite the chapters against the revised plan:\n"
+            f"  writer draft {self.project.name}"
+        )
+
     # ----- critic ----------------------------------------------------------------
 
-    def critic(self) -> None:
-        self._load_bible()
-        drafted = [c for c in self.outline.chapters if self.project.has_chapter(c.number)]
-        if not drafted:
-            raise StageError("No drafted chapters to critique. Run 'draft' first.")
-        self._assemble()
-        novel = self.project.novel_path.read_text(encoding="utf-8")
+    def _critic_system(self) -> str:
+        return (
+            "You are an independent, rigorous developmental editor. You are "
+            "reviewing a novel's PLAN — its premise, characters, world, and chapter "
+            "outline — BEFORE it is written. Judge the story itself: plot logic and "
+            "structure, character arcs, motivation, setup and payoff, pacing, "
+            "originality, thematic coherence, and plausibility. Do NOT comment on "
+            "prose or line-level writing — it does not exist yet. Be candid about "
+            "weaknesses and generous about genuine strengths, and ground every "
+            "judgment in the plan. "
+            f"Write all output in {self.language}."
+        )
 
-        system = (
-            "You are a sharp, fair, and experienced literary critic and editor. "
-            "You judge novels on their merits — prose quality, structure, pacing, "
-            "characterization, theme, originality, and internal consistency — and "
-            "you back every judgment with specific evidence from the text. You are "
-            "candid about weaknesses and generous about genuine strengths. "
-            f"Write your review in {self.language}."
+    def critic(self) -> None:
+        """Story-level review of the PLAN (memory/*.json), before drafting.
+
+        Reads the concept, characters, world, and outline and judges the story —
+        plot, structure, arcs, pacing — so you can critic+revise the outline
+        before spending tokens on draft/polish."""
+        self._load_bible()
+        self.project.init_critique()
+        sys_ = self._critic_system()
+        context = (
+            f"{self._fmt_concept()}\n\n{self._fmt_characters()}\n\n{self._fmt_world()}"
         )
-        user = (
-            "Review the following novel. Produce a structured critique in Markdown "
-            "with these sections: Overall impression; Strengths; Weaknesses; Prose & "
-            "style; Plot & structure; Characters; Pacing; Consistency (flag any "
-            "contradictions or continuity errors with chapter references); Concrete "
-            "suggestions for revision; and a final Verdict with a score out of 10. "
-            "Be specific and cite chapters.\n\n"
-            f"=== STORY BIBLE (for reference) ===\n{self._bible()}\n\n"
-            f"=== NOVEL ===\n{novel}"
+
+        # Step 1: review each chapter's PLAN, building running notes.
+        notes: list[str] = []
+        reviews = []
+        for ch in self.outline.chapters:
+            self._log(f"\n--- Reviewing the plan for Chapter {ch.number}: {ch.title} ---")
+            review = self._review_chapter_plan(ch, context, "\n\n".join(notes), sys_)
+            review.number = ch.number
+            self.project.save_chapter_review(review)
+            notes.append(f"Ch {ch.number} ({ch.title}): {review.digest}")
+            reviews.append((ch.number, ch.title, review))
+
+        # Step 2: aggregate the actionable per-chapter issues (for revision).
+        self.project.save_critique_issues(self._format_issues(reviews))
+
+        # Step 3: synthesize the final whole-story developmental review.
+        self._log("\n--- Final review ---\n")
+        final = self._stream(
+            self._planner_client, self.planner.model, sys_,
+            "Write a structured Markdown developmental review of this novel PLAN, "
+            "judging the story across these aspects, each its own section: Premise & "
+            "hook; Plot & logic (call out plot holes, implausible turns, weak "
+            "causality); Structure & pacing; Characters & arcs; World & setting "
+            "coherence; Theme & originality; Consistency. Then a 'Top priorities "
+            "before drafting' list and a final Verdict with a score out of 10. Cite "
+            "chapters. Base it on the plan and your per-chapter notes below.\n\n"
+            f"=== STORY PLAN ===\n{context}\n\n{self._fmt_outline()}\n\n"
+            f"=== YOUR PER-CHAPTER NOTES ===\n{self._format_issues(reviews)}",
+            CRITIC_MAX_TOKENS,
         )
-        self._log("\n=== Critic review ===\n")
-        review = self._stream(
-            self._planner_client, self.planner.model, system, user, CRITIC_MAX_TOKENS
+        self.project.save_critique(final)
+        self._log(
+            f"\nReview saved to {self.project.critique_path}\n"
+            f"Per-chapter notes under {self.project.critique}/. "
+            "Run 'revise' to rework the plan, then 'draft'."
         )
-        self.project.critique_path.write_text(review + "\n", encoding="utf-8")
-        self._log(f"\nReview saved to {self.project.critique_path}")
+
+    def _review_chapter_plan(self, ch, context, prior_notes, system):
+        notes_block = (
+            f"Your notes on earlier chapters:\n{prior_notes}\n\n" if prior_notes else ""
+        )
+        beats = "\n".join(f"  - {b}" for b in ch.beats)
+        instruction = (
+            f"Story so far (premise, characters, world):\n{context}\n\n"
+            f"{notes_block}"
+            f"Review the PLAN for Chapter {ch.number} (\"{ch.title}\").\n"
+            f"- POV: {ch.pov}\n- Summary: {ch.summary}\n- Purpose: {ch.purpose}\n"
+            f"- Beats:\n{beats}\n\n"
+            "Write a one-line digest of what this chapter is meant to accomplish, "
+            "then list concrete story issues (plot, logic, character, pacing, "
+            "consistency, theme) with actionable fixes, and open questions about "
+            "implausible or unclear developments. If the plan is strong, issues may "
+            "be few or empty — do not invent problems."
+        )
+        return self._plan(instruction, ChapterReview, system=system)
+
+    def _format_issues(self, reviews) -> str:
+        out = []
+        for number, title, review in reviews:
+            lines = [f"## Chapter {number}: {title}"]
+            if review.issues:
+                for i in review.issues:
+                    lines.append(
+                        f"- [{i.aspect}/{i.severity}] {i.problem}\n  → {i.suggestion}"
+                    )
+            if review.questions:
+                for q in review.questions:
+                    lines.append(f"- [question] {q}")
+            if not review.issues and not review.questions:
+                lines.append("- (no significant issues)")
+            out.append("\n".join(lines))
+        return "\n\n".join(out)
 
     # ----- assembly --------------------------------------------------------------
 

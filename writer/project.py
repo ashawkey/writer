@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .models import Characters, Concept, Outline, World
+from .models import Characters, ChapterReview, Concept, Outline, World
 
 DEFAULT_ROOT = "projects"
 
@@ -47,6 +47,7 @@ class Project:
         self.dir = Path(root) / name
         self.memory = self.dir / "memory"
         self.chapters = self.dir / "chapters"
+        self.critique = self.dir / "critique"  # the critic's own working memory
 
     # ----- lifecycle -------------------------------------------------------------
 
@@ -145,6 +146,27 @@ class Project:
         text = self.chapter_path(number).read_text(encoding="utf-8")
         return re.sub(r"^#\s+Chapter\s+\d+:.*?\n+", "", text, count=1).strip()
 
+    def prune_to(self, keep: set[int]) -> list[int]:
+        """Delete chapter files (and their critic reviews + continuity entries)
+        whose number is not in `keep`. Returns the removed chapter numbers."""
+        removed = []
+        for p in self.chapters.glob("ch*.md"):
+            m = re.fullmatch(r"ch(\d+)\.md", p.name)
+            if m and int(m.group(1)) not in keep:
+                p.unlink()
+                removed.append(int(m.group(1)))
+        review_dir = self.critique / "chapters"
+        if review_dir.exists():
+            for p in review_dir.glob("ch*.json"):
+                m = re.fullmatch(r"ch(\d+)\.json", p.name)
+                if m and int(m.group(1)) not in keep:
+                    p.unlink()
+        cont = self.load_continuity()
+        trimmed = {k: v for k, v in cont.items() if k in keep}
+        if trimmed != cont:
+            self.save_continuity(trimmed)
+        return sorted(removed)
+
     # ----- outputs ---------------------------------------------------------------
 
     @property
@@ -154,3 +176,38 @@ class Project:
     @property
     def critique_path(self) -> Path:
         return self.dir / "critique.md"
+
+    # ----- critic working memory -------------------------------------------------
+
+    def init_critique(self) -> None:
+        (self.critique / "chapters").mkdir(parents=True, exist_ok=True)
+
+    def _critique_review_path(self, number: int) -> Path:
+        return self.critique / "chapters" / f"ch{number:02d}.json"
+
+    def save_chapter_review(self, review: ChapterReview) -> None:
+        self._critique_review_path(review.number).write_text(
+            review.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+    def load_chapter_review(self, number: int) -> ChapterReview | None:
+        path = self._critique_review_path(number)
+        if not path.exists():
+            return None
+        return ChapterReview.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def save_critique_issues(self, text: str) -> None:
+        (self.critique / "issues.md").write_text(text + "\n", encoding="utf-8")
+
+    def save_critique(self, text: str) -> None:
+        self.critique_path.write_text(text + "\n", encoding="utf-8")
+
+    def has_critique(self) -> bool:
+        return self.critique_path.exists()
+
+    def read_critique(self) -> str:
+        return self.critique_path.read_text(encoding="utf-8") if self.has_critique() else ""
+
+    def read_critique_issues(self) -> str:
+        path = self.critique / "issues.md"
+        return path.read_text(encoding="utf-8") if path.exists() else ""

@@ -60,3 +60,29 @@ class ChapterPlan(BaseModel):
 
 class Outline(BaseModel):
     chapters: list[ChapterPlan]
+
+
+# ----- critic artifacts (built by the critic from the finished novel) ---------
+
+
+class Issue(BaseModel):
+    aspect: str = Field(
+        description="One of: plot, logic, character, prose, pacing, consistency, theme."
+    )
+    severity: str = Field(description="'minor' or 'major'.")
+    problem: str = Field(description="The specific problem, with a brief quote if useful.")
+    suggestion: str = Field(description="A concrete, actionable fix for revision.")
+
+
+class ChapterReview(BaseModel):
+    number: int = Field(description="Chapter number being reviewed.")
+    digest: str = Field(
+        description="100-180 words: what actually happens in this chapter, written as "
+        "the critic's own memory to reason about the whole novel later."
+    )
+    issues: list[Issue] = Field(
+        description="Problems found in THIS chapter (may be empty if the chapter is strong)."
+    )
+    questions: list[str] = Field(
+        description="Open questions about implausible plot turns, gaps, or unclear logic."
+    )

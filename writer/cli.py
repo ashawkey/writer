@@ -26,14 +26,19 @@ from .engine import StageError, Writer
 from .project import DEFAULT_ROOT, Project, ProjectConfig
 
 
-def _ask(prompt: str, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default else ""
-    while True:
-        ans = input(f"{prompt}{suffix}: ").strip()
-        if ans:
-            return ans
-        if default is not None:
-            return default
+from prompt_toolkit import prompt as _ptk_prompt
+
+
+def _ask(message: str, default: str = "", multiline: bool = False) -> str:
+    """Prompt the user via prompt_toolkit: editable pre-filled default, full line
+    editing, and multiline mode for long instructions."""
+    kwargs = {"default": default or ""}
+    if multiline:
+        kwargs["multiline"] = True
+        kwargs["bottom_toolbar"] = (
+            " Enter = newline · Esc then Enter (or Alt+Enter) = submit "
+        )
+    return _ptk_prompt(f"{message}: ", **kwargs).strip()
 
 
 def _build_writer(project: Project, provider: str | None, draft_provider: str | None) -> Writer:
@@ -92,7 +97,9 @@ class Init:
         )
         prompt = self.prompt
         if prompt is None:
-            raw = _ask("Instructions for the writer (optional)", "")
+            raw = _ask(
+                "Instructions for the writer (optional, multiline)", multiline=True
+            )
             prompt = raw or None
         provider = self.provider or (known[0] if known else None)
 
@@ -148,10 +155,16 @@ class Draft:
 
 
 @dataclass
-class Revise:
-    """Polish chapters and fix consistency — all, or a single one with --chapter."""
+class Polish:
+    """Polish chapter prose and fix consistency — all, or one with --chapter.
+
+    Light pass: improves language/pacing/consistency without changing the plan.
+    Pass optional free-form INSTRUCTIONS to steer it, e.g.
+    `writer polish mybook "avoid the word 'suddenly'; add more action detail"`.
+    """
 
     project: tyro.conf.Positional[str]
+    instructions: tyro.conf.Positional[Optional[str]] = None
     chapter: Optional[int] = None
     provider: Optional[str] = None
     draft_provider: Optional[str] = None
@@ -160,13 +173,38 @@ class Revise:
     def run(self) -> int:
         return _run_stage(
             self.project, self.root, self.provider, self.draft_provider,
-            lambda w: w.revise(self.chapter),
+            lambda w: w.polish(self.chapter, self.instructions),
+        )
+
+
+@dataclass
+class Revise:
+    """Revise the story bible (concept/characters/world/outline) from the critique.
+
+    Run after `critic`. Rewrites only the plan in memory/ — chapters are left
+    untouched; re-run `draft` afterwards to rewrite them against the new plan.
+    """
+
+    project: tyro.conf.Positional[str]
+    provider: Optional[str] = None
+    draft_provider: Optional[str] = None
+    root: str = DEFAULT_ROOT
+
+    def run(self) -> int:
+        return _run_stage(
+            self.project, self.root, self.provider, self.draft_provider,
+            lambda w: w.revise(),
         )
 
 
 @dataclass
 class Critic:
-    """Have the LLM act as a critic and write a review of the novel."""
+    """Review the story PLAN (concept/characters/world/outline), before drafting.
+
+    A developmental editor judges the plot, structure, and character arcs from
+    memory/*.json and writes critique.md plus per-chapter notes. Run it after
+    `outline` so you can `critic` -> `revise` the plan before spending tokens on
+    `draft`."""
 
     project: tyro.conf.Positional[str]
     provider: Optional[str] = None
@@ -183,9 +221,10 @@ class Critic:
 Command = Union[
     Annotated[Init, tyro.conf.subcommand("init")],
     Annotated[Outline, tyro.conf.subcommand("outline")],
-    Annotated[Draft, tyro.conf.subcommand("draft")],
-    Annotated[Revise, tyro.conf.subcommand("revise")],
     Annotated[Critic, tyro.conf.subcommand("critic")],
+    Annotated[Revise, tyro.conf.subcommand("revise")],
+    Annotated[Draft, tyro.conf.subcommand("draft")],
+    Annotated[Polish, tyro.conf.subcommand("polish")],
 ]
 
 

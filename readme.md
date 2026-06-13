@@ -14,26 +14,39 @@ left off — nothing the next command needs is held only in memory.
 ```bash
 writer init <name>               # create a project (asks language/length/prompt)
 writer outline <name>            # concept + characters + world + outline
+writer critic  <name>            # review the PLAN (plot/structure) before drafting
+writer revise  <name>            # rewrite the bible from the critique
 writer draft   <name>            # draft all chapters
 writer draft   <name> --chapter 3   # (re)draft just chapter 3
-writer revise  <name>            # polish + consistency pass (all chapters)
-writer revise  <name> --chapter 3   # revise just chapter 3
-writer critic  <name>            # LLM acts as a critic and reviews the novel
+writer polish  <name>            # light language/consistency pass (all chapters)
+writer polish  <name> --chapter 3   # polish just chapter 3
+writer polish  <name> "more action detail; avoid 'suddenly'"   # one-off focus
 ```
 
 - **init** — saves `project.json` (language, length, instructions, providers).
-- **outline** — the story bible: topic (always LLM-decided), title, genre,
-  themes, synopsis, characters, world, and a chapter outline. The model decides
-  the chapter count and each chapter's word budget (chapters may differ in
-  length) to fit the target total.
+- **outline** — the story bible: topic, title, genre, themes, synopsis, characters,
+  world, and a chapter outline. The model decides the chapter count and each
+  chapter's word budget (chapters may differ in length) to fit the target total.
 - **draft** — writes chapter prose from the bible + a rolling continuity log
   (the "story so far"). With `--chapter N`, writes only that chapter, using the
   saved summaries of earlier chapters for continuity.
-- **revise** — polishes prose and fixes consistency against the bible and the
-  continuity log; all chapters or one.
-- **critic** — switches the LLM into a critic persona and writes a structured
-  review (`critique.md`) with strengths, weaknesses, consistency checks, and a
-  score.
+- **polish** — a light pass that improves prose, pacing, and consistency
+  *without changing the plan*; all chapters or one. Takes an optional one-off
+  instruction (e.g. `"avoid the word 'suddenly'"`) to steer just that pass. Does
+  not read the critique.
+- **critic** — a developmental editor that reviews the **plan** (`memory/*.json`:
+  concept, characters, world, outline) *before* drafting. It judges the story —
+  plot logic, structure, character arcs, pacing, originality — chapter by
+  chapter, flags issues and open questions, and writes a structured review.
+  Outputs `critique.md` plus per-chapter notes and `issues.md` under `critique/`.
+- **revise** — the structural fix. Run after `critic`: it rewrites the **story
+  bible** (concept/characters/world/outline) in `memory/` to address the
+  critique. It does not touch chapter drafts — `draft` regenerates them against
+  the revised plan (and prunes any chapters the new outline dropped).
+
+A typical loop: `outline` → `critic` → `revise` → (repeat) → `draft` → `polish`.
+Because `critic`/`revise` work on the plan, you iterate the story cheaply before
+spending tokens on prose.
 
 Planning stages use JSON-structured output validated against schemas
 (`writer/models.py`); chapter and review text are streamed.
@@ -78,22 +91,6 @@ writer critic  mybook
 `init` asks interactively for anything not passed as a flag. Use `--root <dir>`
 to put projects somewhere other than `projects/`.
 
-### As a library
-
-```python
-from writer import Project, ProjectConfig, Writer, get_provider
-
-proj = Project("mybook")
-proj.create(ProjectConfig(name="mybook", language="English", length=40000,
-                          instructions="cozy mystery in a lighthouse"))
-p = get_provider("deepseek")
-w = Writer(proj, planner=p, drafter=p)
-w.build_outline()
-w.draft()            # or w.draft(chapter=3)
-w.revise()
-w.critic()
-```
-
 ## Project layout
 
 ```
@@ -107,8 +104,11 @@ projects/<name>/
     continuity.json            # resumable per-chapter summaries
   chapters/
     ch01.md, ch02.md, ...
-  novel.md                   # assembled novel (kept in sync after draft/revise)
-  critique.md                # critic review
+  critique/                  # critic's working notes
+    chapters/chNN.json         # per-chapter digest + issues + questions
+    issues.md                  # aggregated actionable issues (feeds revise)
+  novel.md                   # assembled novel (kept in sync after draft/polish)
+  critique.md                # developmental review of the plan
 ```
 
 The `memory/*.json` files are the canonical, resumable state — edit them between
