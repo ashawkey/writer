@@ -1,0 +1,10 @@
+secret.yaml
+projects/
+outputs/
+run.log
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/

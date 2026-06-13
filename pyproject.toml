@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "writer"
+version = "0.2.0"
+description = "Agentic, provider-agnostic system for writing long novels with LLMs."
+readme = "readme.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "openai>=1.40",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "tyro>=0.9",
+]
+
+[project.scripts]
+writer = "writer.cli:main"
+
+[tool.setuptools]
+packages = ["writer"]
