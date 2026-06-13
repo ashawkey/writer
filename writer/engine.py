@@ -4,9 +4,10 @@ Project-backed and resumable: every operation reads its inputs from, and writes
 its outputs to, a Project on disk (see project.py). Operations:
 
     build_outline  -> concept, characters, world, outline (the story bible)
+    critic         -> developmental review of the PLAN, before any prose exists
+    revise         -> re-plan the bible (concept/.../outline) from the critique
     draft          -> chapter prose (all, or one by index), + continuity log
-    revise         -> polish/consistency pass (all, or one)
-    critic         -> a critical review of the finished novel
+    polish         -> per-chapter prose + consistency pass (all, or one)
 
 The model layer talks to any OpenAI-compatible Chat Completions endpoint
 (DeepSeek, OpenAI, local, ...) via config.Provider.
@@ -25,10 +26,31 @@ from .config import Provider
 from .models import ChapterReview, Characters, Concept, Outline, World
 from .project import Project
 
-PLAN_MAX_TOKENS = 8000
-DRAFT_MAX_TOKENS = 8000
+# The backend LLM is assumed to support a very large context/output window
+# (~1M tokens), so these are generous ceilings, not tight budgets. Chapter
+# drafting is sized per-chapter from its word_budget (see _draft_max_tokens).
+PLAN_MAX_TOKENS = 32000
 SUMMARY_MAX_TOKENS = 1000
-CRITIC_MAX_TOKENS = 8000
+CRITIC_MAX_TOKENS = 32000
+
+
+def _draft_max_tokens(word_budget: int) -> int:
+    """Output-token ceiling for drafting one chapter, sized from its word budget.
+
+    Generous headroom: CJK prose can run ~1.5-2 tokens/char, and we never want to
+    clip a chapter mid-sentence. The backend is assumed to allow large outputs."""
+    return max(8000, word_budget * 4)
+
+
+def _count_words(text: str) -> int:
+    """Length metric that works for both space-delimited and CJK scripts: each
+    CJK ideograph/kana/hangul counts as one unit, plus whitespace-delimited runs
+    of any remaining (e.g. Latin) text. `str.split()` alone undercounts CJK,
+    where there are no spaces, by ~100x."""
+    cjk_class = r"㐀-鿿぀-ヿ가-힯"
+    cjk = len(re.findall(f"[{cjk_class}]", text))
+    other = len(re.findall(f"[^\\s{cjk_class}]+", text))
+    return cjk + other
 
 
 def _extract_json(text: str) -> str:
@@ -137,9 +159,17 @@ class Writer:
                     PLAN_MAX_TOKENS, response_format=fmt,
                 )
             except Exception as e:
-                if fmt is None:
+                msg = str(e).lower()
+                rejected = fmt is not None and (
+                    "response_format" in msg
+                    or "json" in msg
+                    or "not support" in msg
+                    or "unsupported" in msg
+                )
+                # Only treat it as a JSON-mode rejection; re-raise real errors
+                # (timeouts, 5xx, auth) so one network blip doesn't disable it.
+                if not rejected:
                     raise
-                # Provider may reject response_format — warn once, retry plain.
                 self._json_mode_ok = False
                 warnings.warn(
                     f"Provider {self.planner.name!r} rejected JSON mode "
@@ -173,15 +203,25 @@ class Writer:
         if response_format is not None:
             kwargs["response_format"] = response_format
         parts: list[str] = []
+        finish_reason = None
         for chunk in client.chat.completions.create(**kwargs):
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta.content or ""
+            choice = chunk.choices[0]
+            delta = choice.delta.content or ""
             if delta:
                 parts.append(delta)
                 sys.stdout.write(delta)
                 sys.stdout.flush()
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
         sys.stdout.write("\n")
+        if finish_reason == "length":
+            self._log(
+                f"  ⚠ output hit the token limit ({max_tokens:,}); the result is "
+                "likely truncated. Increase the budget (or shrink the chapter) and "
+                "re-run."
+            )
         return "".join(parts).strip()
 
     def _stream(self, client, model: str, system: str, user: str, max_tokens: int) -> str:
@@ -191,9 +231,9 @@ class Writer:
         ]
         return self._stream_messages(client, model, messages, max_tokens)
 
-    def _write_stream(self, system: str, user: str) -> str:
+    def _write_stream(self, system: str, user: str, max_tokens: int) -> str:
         return self._stream(
-            self._drafter_client, self.drafter.model, system, user, DRAFT_MAX_TOKENS
+            self._drafter_client, self.drafter.model, system, user, max_tokens
         )
 
     # ----- outline (concept + characters + world + outline) ----------------------
@@ -229,8 +269,7 @@ class Writer:
         self._log("\n=== Characters ===")
         instruction = (
             "Based on the concept below, design the cast. Include the protagonist, "
-            "antagonist (if any), and key supporting characters. "
-            "Give each a distinct voice so their dialogue never blurs together.\n\n"
+            "antagonist (if any), and key supporting characters.\n\n"
             f"{self._fmt_concept()}"
         )
         self.characters = self._plan(instruction, Characters)
@@ -290,7 +329,15 @@ class Writer:
         for ch in targets:
             self._log(f"\n--- Drafting Chapter {ch.number}: {ch.title} ---")
             continuity = self._continuity_before(ch.number, summaries)
-            body = self._write_stream(self._bible_system(), self._draft_prompt(ch, continuity))
+            body = self._write_stream(
+                self._bible_system(),
+                self._draft_prompt(ch, continuity),
+                _draft_max_tokens(ch.word_budget),
+            )
+            if not body:
+                raise RuntimeError(
+                    f"Chapter {ch.number} came back empty from the drafter; aborting."
+                )
             self.project.save_chapter(ch.number, ch.title, body)
             summaries[ch.number] = self._summarize(ch.number, ch.title, body)
             self.project.save_continuity(summaries)
@@ -303,25 +350,37 @@ class Writer:
         self._assemble()
 
     def _draft_prompt(self, ch, continuity: str) -> str:
+        total = len(self.outline.chapters)
         beats = "\n".join(f"  - {b}" for b in ch.beats)
         cont_block = (
-            f"STORY SO FAR (continuity — stay consistent with this):\n{continuity}\n\n"
+            "STORY SO FAR — the continuity log of the chapters before this one. "
+            "Stay fully consistent with it (events, established facts, character "
+            "states) and continue the narrative from where it leaves off. Do NOT "
+            f"recap or re-summarize it for the reader:\n{continuity}\n\n"
             if continuity
             else ""
         )
+        ending = (
+            "This is the FINAL chapter: drive the central conflict to its climax and "
+            "deliver a satisfying resolution; leave no core thread dangling."
+            if ch.number == total
+            else "Close on a beat that creates momentum into the next chapter."
+        )
         return (
             f"{cont_block}"
-            f"Write Chapter {ch.number} of {len(self.outline.chapters)}, titled "
-            f'"{ch.title}".\n'
-            f"POV: {ch.pov}\n"
-            f"Summary: {ch.summary}\n"
+            f'Write Chapter {ch.number} of {total}, titled "{ch.title}".\n'
+            f"POV: {ch.pov} — hold this POV and a consistent tense throughout.\n"
+            f"What happens: {ch.summary}\n"
             f"Purpose: {ch.purpose}\n"
-            f"Beats to hit, in order:\n{beats}\n\n"
-            f"Target length: about {ch.word_budget:,} words. "
-            "Write finished, immersive prose — scene-setting, action, and "
-            "dialogue. Do NOT include the chapter number/title heading, summaries, "
-            "author notes, or meta commentary. Output only the chapter's prose, in "
-            f"{self.language}."
+            "Beats to cover, in order — weave them in naturally; do NOT label or "
+            f"list them in the prose:\n{beats}\n\n"
+            f"Aim for roughly {ch.word_budget:,} words (count characters instead if "
+            "your language does not separate words with spaces).\n"
+            "Write finished, immersive prose: ground each scene in concrete sensory "
+            "detail, reveal character through action and dialogue, and show rather "
+            f"than tell. Keep characterization consistent with the story bible. {ending}\n"
+            "Output ONLY the chapter's prose — no chapter number or title heading, no "
+            f"summary, author notes, or meta commentary. Write in {self.language}."
         )
 
     # ----- revise ----------------------------------------------------------------
@@ -356,19 +415,33 @@ class Writer:
             draft = self.project.read_chapter(ch.number)
             continuity = self._continuity_before(ch.number, summaries)
             cont_block = (
-                f"STORY SO FAR (for consistency):\n{continuity}\n\n" if continuity else ""
+                "STORY SO FAR — continuity from earlier chapters; use it only to "
+                f"check consistency, do not restate it in the prose:\n{continuity}\n\n"
+                if continuity
+                else ""
             )
             user = (
                 f"{cont_block}{focus_block}"
-                f'Polish Chapter {ch.number} ("{ch.title}") below. '
-                "Improve prose quality, pacing, and word choice; fix continuity or "
+                f'Polish Chapter {ch.number} ("{ch.title}"), given below. Sharpen '
+                "the prose line by line: strengthen word choice and rhythm, cut "
+                "padding and clichés, vary sentence structure, and deepen sensory "
+                "and emotional detail. Fix any continuity, POV, tense, or "
                 "characterization slips against the story bible and the story so "
-                "far; tighten weak passages. Keep the plot and structure intact and "
-                "preserve the approximate length. Output ONLY the polished chapter "
-                f"prose, in {self.language}, with no heading or notes.\n\n"
+                "far. Preserve the plot, "
+                "structure, POV, and approximate length — this is a revision, not a "
+                "rewrite. Output ONLY the polished chapter prose, in "
+                f"{self.language}, with no heading, summary, or notes.\n\n"
                 f"--- CURRENT DRAFT ---\n{draft}"
             )
-            revised = self._write_stream(self._bible_system(), user)
+            revised = self._write_stream(
+                self._bible_system(),
+                user,
+                _draft_max_tokens(max(ch.word_budget, _count_words(draft))),
+            )
+            if not revised:
+                raise RuntimeError(
+                    f"Chapter {ch.number} came back empty from the reviser; aborting."
+                )
             self.project.save_chapter(ch.number, ch.title, revised)
             summaries[ch.number] = self._summarize(ch.number, ch.title, revised)
             self.project.save_continuity(summaries)
@@ -411,7 +484,7 @@ class Writer:
             f"{guide}\n\nRevised concept:\n{self._fmt_concept()}\n\n"
             f"Current characters:\n{self._fmt_characters()}\n\n"
             "Produce a revised cast addressing the critique (fix flat or "
-            "inconsistent characters, sharpen distinct voices).",
+            "inconsistent characters, sharpen motivations and arcs).",
             Characters,
         )
         self.project.save_characters(self.characters)
@@ -571,7 +644,7 @@ class Writer:
             lines.append("")
         self.project.novel_path.write_text("\n".join(lines), encoding="utf-8")
         words = sum(
-            len(self.project.read_chapter(ch.number).split())
+            _count_words(self.project.read_chapter(ch.number))
             for ch in self.outline.chapters
             if self.project.has_chapter(ch.number)
         )
@@ -590,11 +663,16 @@ class Writer:
         return "\n\n".join(parts)
 
     def _summarize(self, number: int, title: str, body: str) -> str:
+        system = (
+            "You are a meticulous story editor maintaining a continuity log. "
+            "Write concise, factual summaries with no embellishment or new "
+            f"invention. Write in {self.language}."
+        )
         resp = self._planner_client.chat.completions.create(
             model=self.planner.model,
             max_tokens=SUMMARY_MAX_TOKENS,
             messages=[
-                {"role": "system", "content": self._system()},
+                {"role": "system", "content": system},
                 {
                     "role": "user",
                     "content": (
@@ -676,8 +754,7 @@ class Writer:
                 f"### {ch.name} ({ch.role})\n"
                 f"- Description: {ch.description}\n"
                 f"- Motivation: {ch.motivation}\n"
-                f"- Arc: {ch.arc}\n"
-                f"- Voice: {ch.voice}"
+                f"- Arc: {ch.arc}"
             )
         return "\n\n".join(out)
 

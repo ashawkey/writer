@@ -24,7 +24,6 @@ class Character(BaseModel):
     description: str = Field(description="Appearance, background, defining traits.")
     motivation: str = Field(description="What they want and why.")
     arc: str = Field(description="How they change across the novel.")
-    voice: str = Field(description="Speech/thought style, so dialogue stays distinct.")
 
 
 class Characters(BaseModel):
@@ -67,7 +66,7 @@ class Outline(BaseModel):
 
 class Issue(BaseModel):
     aspect: str = Field(
-        description="One of: plot, logic, character, prose, pacing, consistency, theme."
+        description="One of: plot, logic, character, pacing, consistency, theme."
     )
     severity: str = Field(description="'minor' or 'major'.")
     problem: str = Field(description="The specific problem, with a brief quote if useful.")

@@ -2,11 +2,12 @@
 
 Workflow:
 
-    writer init <name>              create a project (asks language/length/prompt)
-    writer outline --project <name> concept + characters + world + outline
-    writer draft   --project <name> [--chapter N]   write chapters (all or one)
-    writer revise  --project <name> [--chapter N]   polish + consistency pass
-    writer critic  --project <name> review the finished novel
+    writer init <name>                  create a project (asks language/length/prompt)
+    writer outline <name>               concept + characters + world + outline
+    writer critic  <name>               developmental review of the plan
+    writer revise  <name>               re-plan the bible from the critique
+    writer draft   <name> [--chapter N] write chapters (all or one)
+    writer polish  <name> [--chapter N] prose + consistency pass (all or one)
 
 Every stage reads/writes files under the project folder, so any stage can be
 re-run, resumed, or hand-edited between runs. Provider config comes from
@@ -26,19 +27,29 @@ from .engine import StageError, Writer
 from .project import DEFAULT_ROOT, Project, ProjectConfig
 
 
+from html import escape
+
 from prompt_toolkit import prompt as _ptk_prompt
+from prompt_toolkit.formatted_text import HTML
 
 
 def _ask(message: str, default: str = "", multiline: bool = False) -> str:
-    """Prompt the user via prompt_toolkit: editable pre-filled default, full line
-    editing, and multiline mode for long instructions."""
-    kwargs = {"default": default or ""}
+    """Prompt the user via prompt_toolkit. The default is shown as dimmed ghost
+    text (a placeholder), so it reads clearly as a suggestion rather than typed
+    input; pressing Enter on an empty line accepts it."""
+    kwargs = {}
+    if default:
+        kwargs["placeholder"] = HTML(
+            f'<style fg="ansibrightblack">{escape(default)} '
+            "(default — press Enter)</style>"
+        )
     if multiline:
         kwargs["multiline"] = True
         kwargs["bottom_toolbar"] = (
             " Enter = newline · Esc then Enter (or Alt+Enter) = submit "
         )
-    return _ptk_prompt(f"{message}: ", **kwargs).strip()
+    text = _ptk_prompt(f"{message}: ", **kwargs).strip()
+    return text or default
 
 
 def _build_writer(project: Project, provider: str | None, draft_provider: str | None) -> Writer:
