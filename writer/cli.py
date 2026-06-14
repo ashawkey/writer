@@ -2,8 +2,8 @@
 
 Workflow:
 
-    writer init <name>                  create a project (asks language/length/prompt)
-    writer outline <name>               concept + characters + world + outline
+    writer init <name>                  config + interactive concept/characters/world design
+    writer outline <name>               chapter-by-chapter outline (from the init design)
     writer critic  <name>               developmental review of the plan
     writer revise  <name>               re-plan the bible from the critique
     writer draft   <name> [--chapter N] write chapters (all or one)
@@ -81,7 +81,16 @@ def _run_stage(project_name: str, root: str, provider, draft_provider, fn) -> in
 
 @dataclass
 class Init:
-    """Create a new project (asks for anything not given on the command line)."""
+    """Create a new project: ask language/length/topic, then design the story.
+
+    A multi-round step. After saving the config, the agent designs the concept,
+    characters, and world (everything in the story bible except the chapter
+    outline) and shows it to you. You can give free-form feedback to refine the
+    design as many times as you like; press Enter on an empty line to accept it.
+    Then run `writer outline` to plan the chapters.
+
+    Pass `--no-design` to only write the config and skip the interactive design.
+    """
 
     project: tyro.conf.Positional[str]
     language: Optional[str] = None
@@ -89,6 +98,7 @@ class Init:
     prompt: Optional[str] = None
     provider: Optional[str] = None
     draft_provider: Optional[str] = None
+    no_design: bool = False
     root: str = DEFAULT_ROOT
 
     def run(self) -> int:
@@ -109,7 +119,9 @@ class Init:
         prompt = self.prompt
         if prompt is None:
             raw = _ask(
-                "Instructions for the writer (optional, multiline)", multiline=True
+                "Topic or instructions for the writer "
+                "(optional — leave blank to let the writer decide)",
+                multiline=True,
             )
             prompt = raw or None
         provider = self.provider or (known[0] if known else None)
@@ -126,15 +138,54 @@ class Init:
         )
         print(
             f"Created project {self.project!r} at {proj.dir}\n"
-            f"  language={language}  length={length:,}  provider={provider}\n"
-            f"Next: writer outline {self.project}"
+            f"  language={language}  length={length:,}  provider={provider}"
         )
+
+        if self.no_design:
+            print(f"Next: writer outline {self.project}")
+            return 0
+
+        try:
+            writer = _build_writer(proj, self.provider, self.draft_provider)
+            self._design_loop(writer)
+        except (StageError, KeyError, FileNotFoundError, ValueError, RuntimeError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            print(
+                "Config was saved; re-run the design later with: "
+                f"writer outline {self.project} (after adding a design) "
+                "or edit memory/*.json by hand.",
+                file=sys.stderr,
+            )
+            return 1
         return 0
+
+    def _design_loop(self, writer: Writer) -> None:
+        """Generate the design, then refine it from user feedback until accepted."""
+        writer.design()
+        while True:
+            print("\n===== Current design =====")
+            print(writer.design_summary())
+            print("==========================")
+            feedback = _ask(
+                "Feedback to refine the design "
+                "(press Enter to accept and finish)",
+                multiline=True,
+            ).strip()
+            if not feedback:
+                break
+            writer.design(feedback)
+        print(
+            "\nDesign accepted. Concept, characters, and world saved under "
+            f"memory/.\nNext: writer outline {self.project}"
+        )
 
 
 @dataclass
 class Outline:
-    """Generate the story bible: concept, characters, world, and outline."""
+    """Plan the chapter-by-chapter outline from the init design.
+
+    Reads concept/characters/world (created during `init`) and adds the chapter
+    outline — chapter count and per-chapter word budgets. Run `init` first."""
 
     project: tyro.conf.Positional[str]
     provider: Optional[str] = None

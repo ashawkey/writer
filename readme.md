@@ -12,8 +12,8 @@ left off — nothing the next command needs is held only in memory.
 ## Workflow
 
 ```bash
-writer init <name>               # create a project (asks language/length/prompt)
-writer outline <name>            # concept + characters + world + outline
+writer init <name>               # config + interactive concept/characters/world design
+writer outline <name>            # chapter-by-chapter outline (from the init design)
 writer critic  <name>            # review the PLAN (plot/structure) before drafting
 writer revise  <name>            # rewrite the bible from the critique
 writer draft   <name>            # draft all chapters
@@ -23,9 +23,14 @@ writer polish  <name> --chapter 3   # polish just chapter 3
 writer polish  <name> "more action detail; avoid 'suddenly'"   # one-off focus
 ```
 
-- **init** — saves `project.json` (language, length, instructions, providers).
-- **outline** — the story bible: topic, title, genre, themes, synopsis, characters,
-  world, and a chapter outline. The model decides the chapter count and each
+- **init** — saves `project.json` (language, length, instructions, providers),
+  then runs a multi-round design: from your optional topic/instructions the agent
+  designs the **concept, characters, and world**, shows them, and refines them
+  from your free-form feedback until you accept (Enter on an empty line). Writes
+  `memory/concept.json`, `characters.json`, `world.json`. Pass `--no-design` to
+  only write the config and skip the interactive design.
+- **outline** — the chapter outline only: reads the concept/characters/world from
+  `init` and plans the chapters. The model decides the chapter count and each
   chapter's word budget (chapters may differ in length) to fit the target total.
 - **draft** — writes chapter prose from the bible + a rolling continuity log
   (the "story so far"). With `--chapter N`, writes only that chapter, using the
@@ -88,8 +93,9 @@ writer revise  mybook
 writer critic  mybook
 ```
 
-`init` asks interactively for anything not passed as a flag. Use `--root <dir>`
-to put projects somewhere other than `projects/`.
+`init` asks interactively for anything not passed as a flag, then runs the
+design loop (skip it with `--no-design`). Use `--root <dir>` to put projects
+somewhere other than `projects/`.
 
 ## Project layout
 

@@ -236,57 +236,109 @@ class Writer:
             self._drafter_client, self.drafter.model, system, user, max_tokens
         )
 
-    # ----- outline (concept + characters + world + outline) ----------------------
+    # ----- design (concept + characters + world) ---------------------------------
 
-    def build_outline(self) -> None:
-        self._stage_concept()
-        self._stage_characters()
-        self._stage_world()
-        self._stage_outline()
-        self._log("\nOutline complete. Story bible saved under memory/.")
+    def design(self, feedback: str | None = None) -> None:
+        """Build or refine the story bible MINUS the chapter outline: concept,
+        characters, and world.
 
-    def _stage_concept(self) -> None:
+        First pass (`feedback` is None and nothing is loaded): invent the design
+        from the user's topic/instructions. Subsequent passes: revise the loaded
+        design to address `feedback`, regenerating concept, then characters and
+        world so they stay consistent with the revised concept."""
+        feedback = (feedback or "").strip() or None
+        if self.concept is None:  # allow refining an already-saved design
+            self.concept = self.project.load_concept()
+            self.characters = self.project.load_characters()
+            self.world = self.project.load_world()
+        self._stage_concept(feedback)
+        self._stage_characters(feedback)
+        self._stage_world(feedback)
+        self._log("\nDesign saved under memory/ (concept, characters, world).")
+
+    def design_summary(self) -> str:
+        """Human-readable summary of the current design, for review/feedback."""
+        return (
+            f"{self._fmt_concept()}\n\n{self._fmt_characters()}\n\n{self._fmt_world()}"
+        )
+
+    def _stage_concept(self, feedback: str | None = None) -> None:
         self._log("\n=== Concept ===")
-        guidance = (
-            f"The user gave these instructions/wishes (honor them): {self.instructions!r}"
-            if self.instructions
-            else "The user gave no specific instructions."
-        )
-        instruction = (
-            f"Design the concept for a {self.length:,}-word novel.\n{guidance}\n"
-            "Decide the novel's topic yourself — a concise logline. If the user gave "
-            "a subject or constraints, derive the topic from them; otherwise invent "
-            "something compelling and original. Then decide title, genre, tone, "
-            "premise, themes, and a full-arc synopsis. Make it cohesive and "
-            "distinctive — avoid generic, derivative ideas."
-        )
+        if feedback and self.concept is not None:
+            instruction = (
+                "Revise the novel's concept to address the user's feedback below. "
+                "Keep what works; change what they ask for. Stay distinctive and "
+                "cohesive.\n\n"
+                f"USER FEEDBACK:\n{feedback}\n\n"
+                f"CURRENT CONCEPT:\n{self._fmt_concept()}"
+            )
+        else:
+            guidance = (
+                f"The user gave these instructions/wishes (honor them): {self.instructions!r}"
+                if self.instructions
+                else "The user gave no specific instructions."
+            )
+            instruction = (
+                f"Design the concept for a {self.length:,}-word novel.\n{guidance}\n"
+                "Decide the novel's topic yourself — a concise logline. If the user gave "
+                "a subject or constraints, derive the topic from them; otherwise invent "
+                "something compelling and original. Then decide title, genre, tone, "
+                "premise, themes, and a full-arc synopsis. Make it cohesive and "
+                "distinctive — avoid generic, derivative ideas."
+            )
         self.concept = self._plan(instruction, Concept)
         self.project.save_concept(self.concept)
         self._log(f"  Title: {self.concept.title}  ({self.concept.genre})")
         self._log(f"  Topic: {self.concept.topic}")
 
-    def _stage_characters(self) -> None:
+    def _stage_characters(self, feedback: str | None = None) -> None:
         self._log("\n=== Characters ===")
-        instruction = (
-            "Based on the concept below, design the cast. Include the protagonist, "
-            "antagonist (if any), and key supporting characters.\n\n"
-            f"{self._fmt_concept()}"
-        )
+        if feedback and self.characters is not None:
+            instruction = (
+                "Revise the cast to address the user's feedback, staying consistent "
+                "with the (possibly revised) concept below.\n\n"
+                f"USER FEEDBACK:\n{feedback}\n\n"
+                f"{self._fmt_concept()}\n\n"
+                f"CURRENT CHARACTERS:\n{self._fmt_characters()}"
+            )
+        else:
+            instruction = (
+                "Based on the concept below, design the cast. Include the protagonist, "
+                "antagonist (if any), and key supporting characters.\n\n"
+                f"{self._fmt_concept()}"
+            )
         self.characters = self._plan(instruction, Characters)
         self.project.save_characters(self.characters)
         self._log(f"  {len(self.characters.characters)} characters designed.")
 
-    def _stage_world(self) -> None:
+    def _stage_world(self, feedback: str | None = None) -> None:
         self._log("\n=== World & setting ===")
-        instruction = (
-            "Based on the concept and characters below, define the story world: "
-            "setting, time period, atmosphere, the rules that constrain the plot, "
-            "and the key locations.\n\n"
-            f"{self._fmt_concept()}\n\n{self._fmt_characters()}"
-        )
+        if feedback and self.world is not None:
+            instruction = (
+                "Revise the story world to address the user's feedback, staying "
+                "consistent with the (possibly revised) concept and characters "
+                "below.\n\n"
+                f"USER FEEDBACK:\n{feedback}\n\n"
+                f"{self._fmt_concept()}\n\n{self._fmt_characters()}\n\n"
+                f"CURRENT WORLD:\n{self._fmt_world()}"
+            )
+        else:
+            instruction = (
+                "Based on the concept and characters below, define the story world: "
+                "setting, time period, atmosphere, the rules that constrain the plot, "
+                "and the key locations.\n\n"
+                f"{self._fmt_concept()}\n\n{self._fmt_characters()}"
+            )
         self.world = self._plan(instruction, World)
         self.project.save_world(self.world)
         self._log(f"  Setting: {self.world.setting}")
+
+    # ----- outline (chapter-by-chapter; design must exist first) -----------------
+
+    def build_outline(self) -> None:
+        self._load_design()
+        self._stage_outline()
+        self._log("\nOutline complete. Story bible saved under memory/.")
 
     def _stage_outline(self) -> None:
         self._log("\n=== Outline ===")
@@ -688,6 +740,27 @@ class Writer:
         return (resp.choices[0].message.content or "").strip()
 
     # ----- loading / bible -------------------------------------------------------
+
+    def _load_design(self) -> None:
+        """Load concept/characters/world (the design, sans outline). Used by the
+        outline stage, which the `init` design step must have produced first."""
+        self.concept = self.project.load_concept()
+        self.characters = self.project.load_characters()
+        self.world = self.project.load_world()
+        missing = [
+            name
+            for name, obj in (
+                ("concept", self.concept),
+                ("characters", self.characters),
+                ("world", self.world),
+            )
+            if obj is None
+        ]
+        if missing:
+            raise StageError(
+                f"Missing {', '.join(missing)}. Run 'init' to design the story first."
+            )
+        self._bible_cache = None
 
     def _load_bible(self) -> None:
         self.concept = self.project.load_concept()
